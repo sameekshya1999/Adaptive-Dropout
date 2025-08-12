@@ -1,5 +1,4 @@
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,7 +103,7 @@ def train(model, train_loader, val_loader, name, num_classes):
         for data, target in train_loader:
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
-            logits, sigma_a, _ = model(data, mc=True)
+            logits, sigma_a, _ = model(data, adapt=True)
             cls_loss = F.cross_entropy(logits, target)
             noise_loss = ((logits.argmax(1) - target.float())**2 / (sigma_a + 1e-6)).mean()
             loss = cls_loss + 0.1 * noise_loss
@@ -136,33 +135,71 @@ def train(model, train_loader, val_loader, name, num_classes):
                 break
     print(f"{name} trained.")
 
-# MC Dropout test with normalized entropy
+# Helper function for ECE
+def compute_ece(probs, labels, n_bins=15):
+    confidences = probs.max(1)[0]
+    predictions = probs.argmax(1)
+    accuracies = predictions.eq(labels)
+    ece = 0.0
+    bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=device)
+    for i in range(n_bins):
+        in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i+1])
+        prop_in_bin = in_bin.float().mean()
+        if prop_in_bin > 0:
+            acc_in_bin = accuracies[in_bin].float().mean()
+            avg_conf_in_bin = confidences[in_bin].mean()
+            ece += prop_in_bin * torch.abs(avg_conf_in_bin - acc_in_bin)
+    return ece.item()
+
+# MC Dropout test with additional metrics
 def mc_dropout_test(model, loader, name, num_classes):
     model.eval()
     correct = 0
-    start_time = time.time()
+    all_probs = []
+    all_labels = []
     uncertainties = []
+    start_time = time.time()
     with torch.no_grad():
         for data, target in loader:
             data, target = data.to(device), target.to(device)
             outputs = torch.stack([F.softmax(model(data, mc=True)[0], dim=1) for _ in range(mc_samples)], dim=0)
             mean_pred = outputs.mean(0)
             entropy = -torch.sum(mean_pred * torch.log(mean_pred + 1e-6), dim=1)
-            norm_entropy = entropy / np.log(num_classes)  # Normalized to [0,1]
+            norm_entropy = entropy / np.log(num_classes)
             uncertainties.append(norm_entropy.mean().item())
             pred = mean_pred.argmax(1)
             correct += pred.eq(target).sum().item()
+            all_probs.append(mean_pred)
+            all_labels.append(target)
     acc = correct / len(loader.dataset)
     time_taken = time.time() - start_time
     avg_unc = np.mean(uncertainties)
-    print(f"MC Dropout on {name}: Acc {acc:.4f}, Norm Avg Unc {avg_unc:.4f}, Time {time_taken:.2f}s")
 
-# ARB-Dropout test with normalized uncertainty (approximated as entropy + normalized variance)
+    # Concat all batches
+    all_probs = torch.cat(all_probs)
+    all_labels = torch.cat(all_labels)
+
+    # NLL
+    log_probs = torch.log(all_probs + 1e-6)
+    nll = F.nll_loss(log_probs, all_labels)
+
+    # Brier Score
+    one_hot = F.one_hot(all_labels, num_classes=num_classes)
+    brier = ((all_probs - one_hot)**2).sum(1).mean().item()
+
+    # ECE
+    ece = compute_ece(all_probs, all_labels)
+
+    print(f"MC Dropout on {name}: Acc {acc:.4f}, Norm Avg Unc {avg_unc:.4f}, NLL {nll:.4f}, Brier {brier:.4f}, ECE {ece:.4f}, Time {time_taken:.2f}s")
+
+# ARB-Dropout test with additional metrics
 def arb_dropout_test(model, loader, name, num_classes):
     model.eval()
     correct = 0
-    start_time = time.time()
+    all_probs = []
+    all_labels = []
     uncertainties = []
+    start_time = time.time()
     for data, target in loader:
         data, target = data.to(device), target.to(device)
         logits, sigma_a, (h, p_i) = model(data, adapt=True)
@@ -172,15 +209,33 @@ def arb_dropout_test(model, loader, name, num_classes):
         mean_pred = F.softmax(logits, dim=1)
         entropy = -torch.sum(mean_pred * torch.log(mean_pred + 1e-6), dim=1)
         norm_entropy = entropy / np.log(num_classes)
-        norm_var = (var_epistemic.mean(0) + sigma_a.squeeze()) / (num_classes * 10)  # Rough normalization to ~0-1 scale
-        uncertainty = norm_entropy + norm_var  # Combined, starting near 1 for random
+        norm_var = (var_epistemic.mean(0) + sigma_a.squeeze()) / (num_classes * 10)
+        uncertainty = norm_entropy + norm_var
         uncertainties.append(uncertainty.mean().item())
         pred = mean_pred.argmax(1)
         correct += pred.eq(target).sum().item()
+        all_probs.append(mean_pred)
+        all_labels.append(target)
     acc = correct / len(loader.dataset)
     time_taken = time.time() - start_time
     avg_unc = np.mean(uncertainties)
-    print(f"ARB-Dropout on {name}: Acc {acc:.4f}, Norm Avg Unc {avg_unc:.4f}, Time {time_taken:.2f}s")
+
+    # Concat all batches
+    all_probs = torch.cat(all_probs)
+    all_labels = torch.cat(all_labels)
+
+    # NLL
+    log_probs = torch.log(all_probs + 1e-6)
+    nll = F.nll_loss(log_probs, all_labels)
+
+    # Brier Score
+    one_hot = F.one_hot(all_labels, num_classes=num_classes)
+    brier = ((all_probs - one_hot)**2).sum(1).mean().item()
+
+    # ECE
+    ece = compute_ece(all_probs, all_labels)
+
+    print(f"ARB-Dropout on {name}: Acc {acc:.4f}, Norm Avg Unc {avg_unc:.4f}, NLL {nll:.4f}, Brier {brier:.4f}, ECE {ece:.4f}, Time {time_taken:.2f}s")
 
 # Function to test initial (random) model
 def initial_test(model, test_loader, name, num_classes):
